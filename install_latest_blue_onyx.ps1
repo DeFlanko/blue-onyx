@@ -270,7 +270,7 @@ try {
             }
         } elseif ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
             # Run as admin
-            $command = "[System.Environment]::SetEnvironmentVariable('PATH', '$newPath', 'Machine')"
+            $command = "[System.Environment]::SetEnvironmentVariable('PATH', '$destinationPath', 'Machine')"
             Start-Process -FilePath "powershell.exe" -ArgumentList "-Command $command" -Verb RunAs
             Start-Sleep -Seconds 2
             Write-Host "Adding $destinationPath to Environment PATH..." -ForegroundColor Green
