@@ -4,12 +4,12 @@ use tracing::info;
 
 fn main() -> anyhow::Result<()> {
     let parse = Cli::parse();
-    let args = parse;
-    init_logging(args.log_level, args.log_path.clone());
+    let mut args = parse;
+    let _guard = init_logging(args.log_level, &mut args.log_path);
     system_info()?;
 
     if args.download_model_path.is_some() {
-        blue_onyx::download_models::download_models(args.download_model_path.unwrap())?;
+        blue_onyx::download_models::download_models(args.download_model_path.unwrap(), false)?;
         return Ok(());
     }
 

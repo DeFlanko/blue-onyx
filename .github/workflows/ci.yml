@@ -24,7 +24,7 @@ jobs:
     name: build-test-cpu
     env:
       RUST_BACKTRACE: 1
-      RUSTFLAGS: -C target-cpu=native
+      RUSTFLAGS: -C target-cpu=native -D warnings
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,6 +38,15 @@ jobs:
           rust: nightly
         - build: win
           os: windows-latest
+          rust: stable
+        - build: linux beta
+          os: ubuntu-latest
+          rust: beta
+        - build: linux nightly
+          os: ubuntu-latest
+          rust: nightly
+        - build: linux
+          os: ubuntu-latest
           rust: stable
 
     steps:

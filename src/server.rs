@@ -17,12 +17,14 @@ use axum::{
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
 use chrono::Utc;
+use crossbeam::channel::Sender;
 use mime::IMAGE_JPEG;
 use reqwest;
 use serde::Deserialize;
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    sync::{mpsc::Sender, Arc},
+    path::PathBuf,
+    sync::Arc,
     time::Instant,
 };
 use tokio::{
@@ -30,7 +32,7 @@ use tokio::{
     time::{timeout, Duration},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const MEGABYTE: usize = 1024 * 1024; // 1 MB = 1024 * 1024 bytes
 const THIRTY_MEGABYTES: usize = 30 * MEGABYTE; // 30 MB in bytes
@@ -39,6 +41,7 @@ struct ServerState {
     sender: Sender<(
         VisionDetectionRequest,
         oneshot::Sender<VisionDetectionResponse>,
+        Instant,
     )>,
     metrics: Mutex<Metrics>,
 }
@@ -49,16 +52,18 @@ pub async fn run_server(
     sender: Sender<(
         VisionDetectionRequest,
         oneshot::Sender<VisionDetectionResponse>,
+        Instant,
     )>,
     metrics: Metrics,
 ) -> anyhow::Result<()> {
     let server_state = Arc::new(ServerState {
         sender,
-        metrics: Mutex::new(metrics), // TODO: Implement metrics
+        metrics: Mutex::new(metrics),
     });
 
     let blue_onyx = Router::new()
         .route("/", get(welcome_handler))
+        .with_state(server_state.clone())
         .route(
             "/v1/status/updateavailable",
             get(v1_status_update_available),
@@ -99,14 +104,19 @@ pub async fn run_server(
 #[template(path = "welcome.html")]
 struct WelcomeTemplate {
     logo_data: String,
+    metrics: Metrics,
 }
 
-async fn welcome_handler() -> impl IntoResponse {
+async fn welcome_handler(State(server_state): State<Arc<ServerState>>) -> impl IntoResponse {
     const LOGO: &[u8] = include_bytes!("../assets/logo_large.png");
     let encoded_logo = general_purpose::STANDARD.encode(LOGO);
     let logo_data = format!("data:image/png;base64,{}", encoded_logo);
+    let metrics = {
+        let metrics_guard = server_state.metrics.lock().await;
+        metrics_guard.clone()
+    };
 
-    let template = WelcomeTemplate { logo_data };
+    let template = WelcomeTemplate { logo_data, metrics };
     (
         [(CACHE_CONTROL, "no-store, no-cache, must-revalidate")],
         template.into_response(),
@@ -137,23 +147,37 @@ async fn v1_vision_detection(
     }
 
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    if let Err(err) = server_state.sender.send((vision_request, sender)) {
-        error!(?err, "Failed to send request to detection worker");
+
+    if server_state.sender.is_full() {
+        warn!("Worker queue is full server is overloaded, rejecting request");
+        update_dropped_requests(server_state).await;
+        return Err(BlueOnyxError(anyhow::anyhow!("Worker queue is full")));
+    }
+
+    if let Err(err) = server_state
+        .sender
+        .send((vision_request, sender, request_start_time))
+    {
+        warn!(?err, "Failed to send request to detection worker");
+        update_dropped_requests(server_state).await;
+        return Err(BlueOnyxError(anyhow::anyhow!("Worker queue is full")));
     }
     let result = timeout(Duration::from_secs(30), receiver).await;
 
     let mut vision_response = match result {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
-            error!("Failed to receive vision detection response: {:?}", err);
+            warn!("Failed to receive vision detection response: {:?}", err);
+            update_dropped_requests(server_state).await;
             return Err(BlueOnyxError::from(err));
         }
         Err(_) => {
-            error!("Timeout while waiting for vision detection response");
+            warn!("Timeout while waiting for vision detection response");
+            update_dropped_requests(server_state).await;
             return Err(BlueOnyxError::from(anyhow::anyhow!("Operation timed out")));
         }
     };
-    vision_response.analysis_round_trip_ms = request_start_time.elapsed().as_millis() as i32;
+    vision_response.analysisRoundTripMs = request_start_time.elapsed().as_millis() as i32;
 
     {
         let mut metrics = server_state.metrics.lock().await;
@@ -270,11 +294,14 @@ pub async fn get_latest_release_info() -> anyhow::Result<(String, String)> {
 
 #[derive(Debug, Clone)]
 pub struct Metrics {
+    version: String,
+    log_path: String,
     start_time: Instant,
     model_name: String,
     device_name: String,
     execution_provider_name: String,
     number_of_requests: u128,
+    dropped_requests: u128,
     total_inference_ms: u128,
     min_inference_ms: i32,
     max_inference_ms: i32,
@@ -287,13 +314,24 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn new(model_name: String, device_name: String, execution_provider: String) -> Self {
+    pub fn new(
+        model_name: String,
+        device_name: String,
+        execution_provider: String,
+        log_path: Option<PathBuf>,
+    ) -> Self {
         Self {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            log_path: log_path
+                .unwrap_or_else(|| PathBuf::from("stdout"))
+                .to_string_lossy()
+                .to_string(),
             start_time: Instant::now(),
             model_name,
             device_name,
             execution_provider_name: execution_provider,
             number_of_requests: 0,
+            dropped_requests: 0,
             total_inference_ms: 0,
             min_inference_ms: i32::MAX,
             max_inference_ms: i32::MIN,
@@ -318,23 +356,27 @@ impl Metrics {
         self.number_of_requests = self.number_of_requests.wrapping_add(1);
         self.total_inference_ms = self
             .total_inference_ms
-            .wrapping_add(response.inference_ms as u128);
-        self.min_inference_ms = self.min_inference_ms.min(response.inference_ms);
-        self.max_inference_ms = self.max_inference_ms.max(response.inference_ms);
+            .wrapping_add(response.inferenceMs as u128);
+        self.min_inference_ms = self.min_inference_ms.min(response.inferenceMs);
+        self.max_inference_ms = self.max_inference_ms.max(response.inferenceMs);
         self.total_processing_ms = self
             .total_processing_ms
-            .wrapping_add(response.process_ms as u128);
-        self.min_processing_ms = self.min_processing_ms.min(response.process_ms);
-        self.max_processing_ms = self.max_processing_ms.max(response.process_ms);
+            .wrapping_add(response.processMs as u128);
+        self.min_processing_ms = self.min_processing_ms.min(response.processMs);
+        self.max_processing_ms = self.max_processing_ms.max(response.processMs);
         self.total_analysis_round_trip_ms = self
             .total_analysis_round_trip_ms
-            .wrapping_add(response.analysis_round_trip_ms as u128);
+            .wrapping_add(response.analysisRoundTripMs as u128);
         self.min_analysis_round_trip_ms = self
             .min_analysis_round_trip_ms
-            .min(response.analysis_round_trip_ms);
+            .min(response.analysisRoundTripMs);
         self.max_analysis_round_trip_ms = self
             .max_analysis_round_trip_ms
-            .max(response.analysis_round_trip_ms);
+            .max(response.analysisRoundTripMs);
+    }
+
+    fn update_dropped_requests(&mut self) {
+        self.dropped_requests = self.dropped_requests.wrapping_add(1);
     }
 
     fn avg_ms(&self, total_ms: u128) -> i32 {
@@ -356,6 +398,12 @@ impl Metrics {
     fn avg_analysis_round_trip_ms(&self) -> i32 {
         self.avg_ms(self.total_analysis_round_trip_ms)
     }
+}
+
+async fn update_dropped_requests(server_state: Arc<ServerState>) {
+    warn!("If you see this message spamming you should reduce the number of requests or upgrade your service to be faster.");
+    let mut metrics = server_state.metrics.lock().await;
+    metrics.update_dropped_requests();
 }
 
 #[derive(Template)]
@@ -392,7 +440,10 @@ async fn handle_upload(
             };
 
             let (sender, receiver) = tokio::sync::oneshot::channel();
-            if let Err(err) = server_state.sender.send((vision_request, sender)) {
+            if let Err(err) = server_state
+                .sender
+                .send((vision_request, sender, request_start_time))
+            {
                 error!(?err, "Failed to send request to detection worker");
             }
             let result = timeout(Duration::from_secs(30), receiver).await;
@@ -420,8 +471,7 @@ async fn handle_upload(
                 image_data: Some(&data_url),
             };
 
-            vision_response.analysis_round_trip_ms =
-                request_start_time.elapsed().as_millis() as i32;
+            vision_response.analysisRoundTripMs = request_start_time.elapsed().as_millis() as i32;
 
             {
                 let mut metrics = server_state.metrics.lock().await;
@@ -449,12 +499,12 @@ impl IntoResponse for BlueOnyxError {
                 predictions: vec![],
                 count: 0,
                 command: "".into(),
-                module_id: "".into(),
-                execution_provider: "".into(),
-                can_useGPU: false,
-                inference_ms: 0_i32,
-                process_ms: 0_i32,
-                analysis_round_trip_ms: 0_i32,
+                moduleId: "".into(),
+                executionProvider: "".into(),
+                canUseGPU: false,
+                inferenceMs: 0_i32,
+                processMs: 0_i32,
+                analysisRoundTripMs: 0_i32,
             }),
         )
             .into_response()

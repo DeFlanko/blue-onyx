@@ -1,15 +1,11 @@
 use clap::ValueEnum;
 use cli::Cli;
+use detector::OnnxConfig;
 use serde::Deserialize;
 use server::run_server;
 use std::{future::Future, path::PathBuf};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn, Level};
-use windows::Win32::System::Threading::{
-    GetCurrentProcessorNumber, GetCurrentThread, SetThreadAffinityMask, SetThreadPriority,
-    THREAD_PRIORITY_TIME_CRITICAL,
-};
-
+use tracing::{info, Level};
 pub mod api;
 pub mod cli;
 pub mod detector;
@@ -37,21 +33,25 @@ pub fn blue_onyx_service(
     std::thread::JoinHandle<()>,
 )> {
     let detector_config = detector::DetectorConfig {
-        model: args.model,
+        object_detection_onnx_config: OnnxConfig {
+            force_cpu: args.force_cpu,
+            gpu_index: args.gpu_index,
+            intra_threads: args.intra_threads,
+            inter_threads: args.inter_threads,
+            model: args.model,
+        },
         object_classes: args.object_classes,
         object_filter: args.object_filter,
         confidence_threshold: args.confidence_threshold,
-        force_cpu: args.force_cpu,
         save_image_path: args.save_image_path,
         save_ref_image: args.save_ref_image,
-        gpu_index: args.gpu_index,
-        intra_threads: args.intra_threads,
-        inter_threads: args.inter_threads,
+        timeout: args.request_timeout,
+        object_detection_model: args.object_detection_model_type,
     };
 
-    let (sender, receive) = std::sync::mpsc::channel();
     // Run a separate thread for the detector worker
-    let mut detector_worker = worker::DetectorWorker::new(detector_config, receive)?;
+    let (sender, mut detector_worker) =
+        worker::DetectorWorker::new(detector_config, args.worker_queue_size)?;
 
     let detector = detector_worker.get_detector();
     let model_name = detector.get_model_name();
@@ -63,22 +63,31 @@ pub fn blue_onyx_service(
     } else {
         system_info::cpu_model()
     };
-    let metrics = server::Metrics::new(model_name.clone(), device_name, execution_providers_name);
+    let metrics = server::Metrics::new(
+        model_name.clone(),
+        device_name,
+        execution_providers_name,
+        args.log_path,
+    );
     let cancel_token = CancellationToken::new();
     let server_future = run_server(args.port, cancel_token.clone(), sender, metrics);
 
     let thread_handle = std::thread::spawn(move || {
-        #[cfg(target_os = "windows")]
+        #[cfg(windows)]
         unsafe {
+            use windows::Win32::System::Threading::{
+                GetCurrentProcessorNumber, GetCurrentThread, SetThreadAffinityMask,
+                SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+            };
             let thread_handle = GetCurrentThread();
             if let Err(err) = SetThreadPriority(thread_handle, THREAD_PRIORITY_TIME_CRITICAL) {
-                error!(?err, "Failed to set thread priority to time critical");
+                tracing::error!(?err, "Failed to set thread priority to time critical");
             }
             let processor_number = GetCurrentProcessorNumber();
             let core_mask = 1usize << processor_number;
             let previous_mask = SetThreadAffinityMask(thread_handle, core_mask);
             if previous_mask == 0 {
-                error!("Failed to set thread affinity.");
+                tracing::error!("Failed to set thread affinity.");
             }
         }
         detector_worker.run();
@@ -96,38 +105,58 @@ pub fn get_object_classes(yaml_file: Option<PathBuf>) -> anyhow::Result<Vec<Stri
 }
 
 pub fn direct_ml_available() -> bool {
-    if let Ok(exe_path) = std::env::current_exe() {
-        let exe_dir = exe_path.parent().unwrap();
-        let direct_ml_path = exe_dir.join("DirectML.dll");
-        let direct_ml_available = direct_ml_path.exists();
-        if !direct_ml_available {
-            warn!("DirectML.dll not found in the same directory as the executable");
-        }
-        return direct_ml_available;
+    #[cfg(not(windows))]
+    {
+        false
     }
-    warn!("Failed to get current executable path");
-    false
+    #[cfg(windows)]
+    {
+        let Ok(exe_path) = std::env::current_exe() else {
+            return false;
+        };
+        let Some(exe_dir) = exe_path.parent() else {
+            return false;
+        };
+        exe_dir.join("DirectML.dll").exists()
+    }
 }
 
 pub fn init_logging(
     log_level: LogLevel,
-    log_path: Option<PathBuf>,
+    log_path: &mut Option<PathBuf>,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     setup_ansi_support();
 
-    if let Some(log_path) = log_path {
-        println!(
-            "Starting Blue Onyx, logging into: {}/blue_onyx.log",
-            log_path.display()
-        );
-        let file_appender = tracing_appender::rolling::daily(&log_path, "blue_onyx.log");
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let guard = log_path.clone().map(|path| {
+        let log_directory = if path.starts_with(".") {
+            let stripped = path.strip_prefix(".").unwrap_or(&path).to_path_buf();
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|p| p.join(stripped.clone())))
+                .unwrap_or(stripped)
+        } else {
+            path
+        };
+
+        *log_path = Some(log_directory.clone());
+
+        let log_file = log_directory.join("blue_onyx.log");
+        println!("Starting Blue Onyx, logging into: {}", log_file.display());
+
+        let file_appender = tracing_appender::rolling::daily(&log_directory, "blue_onyx.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
         tracing_subscriber::fmt()
             .with_writer(non_blocking)
             .with_max_level(Level::from(log_level))
             .with_ansi(false)
             .init();
-        Some(_guard)
+
+        guard
+    });
+
+    if guard.is_some() {
+        guard
     } else {
         tracing_subscriber::fmt()
             .with_max_level(Level::from(log_level))

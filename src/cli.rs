@@ -1,6 +1,6 @@
-use crate::LogLevel;
+use crate::{detector::ObjectDetectionModel, LogLevel};
 use clap::Parser;
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 #[derive(Parser)]
 #[command(author = "Marcus Asteborg", version=env!("CARGO_PKG_VERSION"), about = "TODO")]
@@ -10,10 +10,26 @@ pub struct Cli {
     //#[arg(long, default_value_t = 32168)]
     #[arg(long, default_value_t = 32168)]
     pub port: u16,
-    /// Path to the ONNX rt-detrv2 onnx model file.
-    /// If not given the default model small model is used.
+    /// Duration to wait for a response from the detection worker.
+    /// Ideally, this should be similar to the client's timeout setting.
+    #[arg(long, default_value = "15", value_parser = parse_duration)]
+    pub request_timeout: Duration,
+    /// Worker queue size.
+    /// The number of requests that can be queued before the server starts rejecting them.
+    /// If not set, the server will estimate the queue size based on the timeout and the
+    /// inference performance.
+    /// This estimation is based on the timeout and the expected number of requests per second.
+    #[arg(long)]
+    pub worker_queue_size: Option<usize>,
+    /// Path to the ONNX model file.
+    /// If not specified, the default rt-detrv2 small model will be used
+    /// provided it is available in the directory.
     #[clap(long)]
     pub model: Option<PathBuf>,
+    /// Type of model type to use.
+    /// Default: rt-detrv2
+    #[clap(long, default_value_t = ObjectDetectionModel::RtDetrv2)]
+    pub object_detection_model_type: ObjectDetectionModel,
     /// Path to the object classes yaml file
     /// Default: coco_classes.yaml which is the 80 standard COCO classes
     #[clap(long)]
@@ -34,11 +50,27 @@ pub struct Cli {
     /// Force using CPU for inference
     #[clap(long, default_value_t = false)]
     pub force_cpu: bool,
-    /// Intra thread parallelism max is cpu cores - 1
+    /// Intra thread parallelism max is CPU cores - 1.
+    /// On Windows, you can use high thread counts, but if you use too high
+    /// thread count on Linux, you will get a BIG performance hit.
+    /// So default is 1, then you can increase it if you want to test the
+    /// performance.
+    #[cfg(target_os = "windows")]
     #[clap(long, default_value_t = 192)]
     pub intra_threads: usize,
-    /// Inter thread parallelism max is cpu cores - 1
+    #[cfg(not(target_os = "windows"))]
+    #[clap(long, default_value_t = 2)]
+    pub intra_threads: usize,
+    /// Inter thread parallelism max is CPU cores - 1.
+    /// On Windows, you can use high thread counts, but if you use too high
+    /// thread count on Linux, you will get a BIG performance hit.
+    /// So default is 2, then you can increase it if you want to test the
+    /// performance.
+    #[cfg(target_os = "windows")]
     #[clap(long, default_value_t = 192)]
+    pub inter_threads: usize,
+    #[cfg(not(target_os = "windows"))]
+    #[clap(long, default_value_t = 2)]
     pub inter_threads: usize,
     /// Optional path to save the processed images
     #[clap(long)]
@@ -60,4 +92,9 @@ pub struct Cli {
     /// and then exit
     #[clap(long)]
     pub download_model_path: Option<PathBuf>,
+}
+
+fn parse_duration(s: &str) -> anyhow::Result<Duration> {
+    let secs: u64 = s.parse()?;
+    Ok(Duration::from_secs(secs))
 }
